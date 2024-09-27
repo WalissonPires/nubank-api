@@ -1,20 +1,21 @@
 import { PAYMENT_EVENT_TYPES } from "./constants";
-import {
-  AccountTransaction,
-  Bill,
-  Customer,
-  Investment,
-  PixKey,
-} from "./models";
-import { Context } from "./context";
+import { AccountTransaction, Customer, Investment, PixKey } from "./models";
+import { AuthType, Context } from "./context";
 import * as GqlOperations from "./utils/graphql-operations";
+import { parseGenericTransaction } from "./utils/parsing";
+import { RequiresAuth } from "./utils/decorators";
 
 export class Account {
   private _accountId: string = "";
   private _customerId: string = "";
 
+  public get context(): Context {
+    return this._context;
+  }
+
   public constructor(private _context: Context) {}
 
+  @RequiresAuth(AuthType.CERT, AuthType.WEB)
   public me(): Promise<Customer> {
     return this._context.http
       .request("get", "customer")
@@ -31,16 +32,19 @@ export class Account {
     }
   }
 
+  @RequiresAuth(AuthType.CERT)
   public async getId(): Promise<string> {
     await this.ready();
     return this._accountId;
   }
 
+  @RequiresAuth(AuthType.CERT)
   public async getCustomerId(): Promise<string> {
     await this.ready();
     return this._customerId;
   }
 
+  @RequiresAuth(AuthType.CERT)
   public async getPixKeys(): Promise<PixKey[]> {
     const { data } = await this._context.http.graphql(
       GqlOperations.QUERY_GET_PIX_KEYS
@@ -48,41 +52,7 @@ export class Account {
     return data?.viewer?.savingsAccount?.dict?.keys;
   }
 
-  public async getBills(options: {
-    getFutureBillsDetails?: boolean;
-    billsAfterDueDate?: Date;
-  }): Promise<Bill[]> {
-    options = { getFutureBillsDetails: false, ...options };
-
-    const data = await this._context.http.request("get", "bills_summary");
-
-    const futureBillsUrl = data._links?.future?.href;
-    let bills = data.bills;
-
-    if (options.getFutureBillsDetails && futureBillsUrl) {
-      const dataFuture = await this._context.http.request(
-        "get",
-        futureBillsUrl
-      );
-      const closedAndOpenedBills = data.bills.filter(
-        (bill: Bill) => bill.state !== "future"
-      );
-      bills = dataFuture.bills.concat(closedAndOpenedBills);
-    }
-
-    if (options.billsAfterDueDate) {
-      bills = bills.filter(
-        (bill: Bill) =>
-          this.parseDate(bill.summary.due_date) >=
-          (options.billsAfterDueDate as Date)
-      );
-    }
-
-    return await Promise.all(
-      bills.map((bill: Bill) => this.getBillDetails(bill))
-    );
-  }
-
+  @RequiresAuth(AuthType.CERT)
   public async getBalance(): Promise<number> {
     const { data } = await this._context.http.graphql(
       GqlOperations.QUERY_ACCOUNT_BALANCE
@@ -90,13 +60,23 @@ export class Account {
     return data.viewer?.savingsAccount?.currentSavingsBalance?.netAmount;
   }
 
+  /**
+   *
+   * @deprecated Use getFeedPaginated instead
+   */
+  @RequiresAuth(AuthType.CERT)
   public async getFeed(): Promise<AccountTransaction[]> {
     const { data } = await this._context.http.graphql(
       GqlOperations.QUERY_ACCOUNT_FEED
     );
-    return data?.viewer?.savingsAccount?.feed;
+    return data?.viewer?.savingsAccount?.feed.map(parseGenericTransaction);
   }
 
+  /**
+   *
+   * @deprecated Use getTransactionsPaginated instead
+   */
+  @RequiresAuth(AuthType.CERT)
   public getTransactions(): Promise<AccountTransaction[]> {
     return this.getFeed().then((feed) =>
       feed.filter((statement) =>
@@ -105,28 +85,39 @@ export class Account {
     );
   }
 
+  @RequiresAuth(AuthType.CERT)
+  public async getFeedPaginated(
+    cursor?: string
+  ): Promise<{ items: AccountTransaction[]; nextCursor?: string }> {
+    const { data } = await this._context.http.graphql(
+      GqlOperations.QUERY_ACCOUNT_FEED_PAGINATED,
+      { cursor }
+    );
+    const { feedItems } = data?.viewer?.savingsAccount ?? {};
+    const items =
+      feedItems?.edges.map((edge: any) => parseGenericTransaction(edge.node)) ??
+      [];
+    const nextCursor = feedItems?.pageInfo?.hasNextPage
+      ? feedItems?.edges?.slice(-1)[0]?.cursor
+      : undefined;
+
+    return { items, nextCursor };
+  }
+
+  @RequiresAuth(AuthType.CERT)
+  public getTransactionsPaginated(
+    cursor?: string
+  ): Promise<AccountTransaction[]> {
+    return this.getFeedPaginated(cursor).then(({ items }) =>
+      items.filter((statement) => statement.amount! > 0)
+    );
+  }
+
+  @RequiresAuth(AuthType.CERT)
   public async getInvestments(): Promise<Investment[]> {
     const { data } = await this._context.http.graphql(
       GqlOperations.QUERY_ACCOUNT_INVESTMENTS
     );
     return data?.viewer?.savingsAccount?.redeemableDeposits;
-  }
-
-  private async getBillDetails(bill: Bill): Promise<Bill> {
-    const url: string = bill?._links?.self?.href ?? "";
-    if (!url) {
-      return bill;
-    }
-    const response: any = await this._context.http.request("get", url);
-    return response.bill;
-  }
-
-  private parseDate(dateStr: string): Date {
-    const dateParts = dateStr.split("-");
-    return new Date(
-      parseInt(dateParts[0], 10),
-      parseInt(dateParts[1], 10),
-      parseInt(dateParts[2], 10)
-    );
   }
 }
